@@ -1,0 +1,5 @@
+data/*
+doc/*
+.vscode/*
+.DS_Store
+*.pyc
