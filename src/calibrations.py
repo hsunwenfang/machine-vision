@@ -130,15 +130,15 @@ def find_checkerboard_corners(images, pattern_size=(9, 12)): # KITTI is often 9x
 
     return objpoints, imgpoints, (gray.shape[1], gray.shape[0]), found_count
 
-def run_recalibration_experiment(calib_img_dir, target_calib_data):
+def run_recalibration_experiment(calib_img_dir, target_calib_data, cam_l_name='image_00', cam_r_name='image_01'):
     """
     Runs full calibration pipeline on raw checkerboard images and compares with KITTI txt.
     """
-    print("\nXXX RUNNING RE-CALIBRATION EXPERIMENT XXX")
+    print(f"\nXXX RUNNING RE-CALIBRATION EXPERIMENT ({cam_l_name}, {cam_r_name}) XXX")
     
     # 1. Gather Images
-    left_dir = os.path.join(calib_img_dir, 'image_02', 'data') # Gray Left
-    right_dir = os.path.join(calib_img_dir, 'image_03', 'data') # Gray Right
+    left_dir = os.path.join(calib_img_dir, cam_l_name, 'data') 
+    right_dir = os.path.join(calib_img_dir, cam_r_name, 'data') 
     
     if not os.path.exists(left_dir):
         print(f"Calibration images not found at {left_dir}")
@@ -150,107 +150,82 @@ def run_recalibration_experiment(calib_img_dir, target_calib_data):
     print(f"Found {len(left_images)} stereo pairs for calibration.")
     
     # 2. Find Corners
-    # Try different pattern sizes since we don't know the exact one used
-    # Note: OpenCV pattern size is (inner_cols, inner_rows)
-    # KITTI usually uses a large board. The user data might only show a PART of the board
-    # or the board is smaller.
-    # Let's try to visualize one image to see what's going on if you were debugging manually,
-    # but here we'll just try more patterns.
-    pattern_size = None
-    found_common_pattern = False
-    
-    # Pre-load a few images
-    test_params_l = [cv2.imread(f, 0) for f in left_images] # Load ALL to check
-    test_params_r = [cv2.imread(f, 0) for f in right_images]
-
-    # Try to find ANY pattern that works for BOTH Left and Right
-    best_pattern = None
-    max_valid_pairs = 0
+    shape = None
     
     # Expanded list based on typical boards
     candidate_patterns = [(5,7), (7,5), (6, 11), (11, 6)]
-
-    for pat in candidate_patterns:
-        valid_pairs_count = 0
-        # Check pairs
-        for im_l, im_r in zip(test_params_l, test_params_r):
-             if im_l is None or im_r is None: continue
-             ret_l, _ = cv2.findChessboardCorners(im_l, pat, None)
-             if ret_l:
-                 ret_r, _ = cv2.findChessboardCorners(im_r, pat, None)
-                 if ret_r:
-                     valid_pairs_count += 1
-        print(f"Pattern {pat}: {valid_pairs_count} valid stereo pairs found.")
-        if valid_pairs_count > max_valid_pairs:
-            max_valid_pairs = valid_pairs_count
-            best_pattern = pat
-    
-    if max_valid_pairs < 3:
-         print("Could not find a pattern size with enough valid stereo pairs (>3).")
-         return
-         
-    pattern_size = best_pattern
-    print(f"Selected best pattern: {pattern_size} with {max_valid_pairs} pairs.")
-
-    print(f"Detecting all corners with pattern: {pattern_size}...")
-    objpoints, imgpoints_l, shape, n_l = find_checkerboard_corners(left_images, pattern_size)
-    _, imgpoints_r, _, n_r = find_checkerboard_corners(right_images, pattern_size)
-    
-    if n_l < 3 or n_r < 3:
-        print(f"Not enough corners found overall (Left: {n_l}, Right: {n_r}).")
-        return
-
-    # We need matching pairs where BOTH found corners
-    # (Since find_checkerboard_corners returns lists only for successes, indices might misalign 
-    # if one image failed and the other succeeded. A robust implementation tracks indices.)
-    # Quick fix: Iterate loop manually paired.
+    # Optimized Loop: Detect and Collect in one pass (Greedy approach)
+    # Sort patterns by complexity (area) so we prefer finding the largest full board first
+    sorted_patterns = sorted(candidate_patterns, key=lambda p: p[0]*p[1], reverse=True)
     
     objpoints = []
     imgpoints_l = []
     imgpoints_r = []
-    
-    # Reliable paired collection
-    objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
-    
-    # Scale factor (approximate square size in meters, e.g. 0.1m)
-    # This affects translation (T) magnitude.
-    square_size = 0.1 
-    objp = objp * square_size
-    
     valid_pairs = 0
-    for f_l, f_r in zip(left_images, right_images):
+
+    print("\nScanning images using ALL candidate patterns (Largest first)...")
+    
+    for i, (f_l, f_r) in enumerate(zip(left_images, right_images)):
         img_l = cv2.imread(f_l, 0)
         img_r = cv2.imread(f_r, 0)
         
-        ret_l, corners_l = cv2.findChessboardCorners(img_l, pattern_size, None)
-        ret_r, corners_r = cv2.findChessboardCorners(img_r, pattern_size, None)
-        
-        if ret_l and ret_r:
-            objpoints.append(objp)
+        if img_l is None or img_r is None: continue
+        if shape is None: shape = img_l.shape[::-1]
+
+        # Check this image pair against all patterns
+        # for pat in sorted_patterns:
+        # Using discovered larger pattern (7, 11) - covers 77 points vs 35
+        for pat in [(7,11), (11,7)]:
+            ret_l, corners_l = cv2.findChessboardCorners(img_l, pat, None)
+            if not ret_l: continue
             
+            # If found in Left, verify Right
+            ret_r, corners_r = cv2.findChessboardCorners(img_r, pat, None)
+            if not ret_r: continue
+            
+            # --- Valid Pair Found ---
+            # 1. Generate Object Points specific to THIS pattern
+            objp = np.zeros((pat[0] * pat[1], 3), np.float32)
+            objp[:, :2] = np.mgrid[0:pat[0], 0:pat[1]].T.reshape(-1, 2)
+            objp = objp * 0.1 # Assumed square size (meters)
+            
+            # 2. Refine Corners (Subpixel)
             term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
             corners_l = cv2.cornerSubPix(img_l, corners_l, (11, 11), (-1, -1), term)
             corners_r = cv2.cornerSubPix(img_r, corners_r, (11, 11), (-1, -1), term)
             
+            # 3. Collect
+            objpoints.append(objp)
             imgpoints_l.append(corners_l)
             imgpoints_r.append(corners_r)
             valid_pairs += 1
             
-    print(f"Used {valid_pairs} valid pairs for stereo calibration.")
+            print(f"  Frame {i:02d}: Accepted pattern {pat}")
+            # Stop after finding the largest pattern to avoid duplicates/subsets
+            break
+    
+    print(f"Collected total {valid_pairs} valid pairs for stereo calibration.")
     if valid_pairs < 3:
-        print("Error: Too few valid pairs.")
-        return
+         print("Error: Too few valid pairs found.")
+         return
 
     # 3. Individual Calibration (Optional, helps Stereo)
     # Using FIX_ASPECT_RATIO and other flags to make it more robust for small datasets
-    print("Performing individual camera calibration...")
-    ret_l, K_l, D_l, rvecs_l, tvecs_l = cv2.calibrateCamera(objpoints, imgpoints_l, shape, None, None)
-    ret_r, K_r, D_r, rvecs_r, tvecs_r = cv2.calibrateCamera(objpoints, imgpoints_r, shape, None, None)
+    # ROBUST SCHEME: Fix Aspect Ratio and Principal Point to prevent parameter drift
+    print("Performing individual camera calibration (ROBUST MODE)...")
+    robust_flags = cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_FIX_PRINCIPAL_POINT
+    
+    ret_l, K_l, D_l, rvecs_l, tvecs_l = cv2.calibrateCamera(
+        objpoints, imgpoints_l, shape, None, None, flags=robust_flags
+    )
+    ret_r, K_r, D_r, rvecs_r, tvecs_r = cv2.calibrateCamera(
+        objpoints, imgpoints_r, shape, None, None, flags=robust_flags
+    )
     
     # 4. Stereo Calibration
     # Computes R, T between cameras
     # Using CALIB_USE_INTRINSIC_GUESS because we just calculated K_l, K_r
+    # We continue to enforce the constraints
     flags = cv2.CALIB_FIX_INTRINSIC
     
     print("Performing stereo calibration...")
@@ -283,11 +258,10 @@ def run_recalibration_experiment(calib_img_dir, target_calib_data):
         print("\n--- COMPARISON with calib_cam_to_cam.txt ---")
         
         # Compare K (Intrinsics)
-        # Note: KITTI calib file uses 'K_02' for left gray, 'K_03' for right gray usually?
-        # Or 00/01. The user path used image_02/03 in prior steps?
-        # Let's assume we are comparing against 02 (Left)
+        cam_id = cam_l_name.split('_')[-1] # '02' or '00'
         
-        K_kitti = target_calib_data.get('K_02')
+        # Try to find corresponding key
+        K_kitti = target_calib_data.get(f'K_{cam_id}')
         if K_kitti is not None:
             K_kitti = K_kitti.reshape(3,3)
             err_fx = abs(K_l[0,0] - K_kitti[0,0])
@@ -296,12 +270,9 @@ def run_recalibration_experiment(calib_img_dir, target_calib_data):
             print(f"Principal Point (cx) Diff: {err_cx:.4f} (Calc: {K_l[0,2]:.2f} vs Txt: {K_kitti[0,2]:.2f})")
         
         # Compare P_rect (New Projection)
-        P_kitti = target_calib_data.get('P_rect_02')
+        P_kitti = target_calib_data.get(f'P_rect_{cam_id}')
         if P_kitti is not None:
             P_kitti = P_kitti.reshape(3,4)
-            # P1 is calculated P_rect for left
-            # Scale P1 by the ratio of fx for fair comparison if checker size was wrong?
-            # No, P matrix elements are in pixels, so they should match if K matches.
             err_p_fx = abs(P1[0,0] - P_kitti[0,0])
             print(f"Rectified fx Diff: {err_p_fx:.4f} (Calc: {P1[0,0]:.2f} vs Txt: {P_kitti[0,0]:.2f})")
     
@@ -316,15 +287,6 @@ def main():
     # Paths (Adjusted to workspace structure)
     BASE_DIR_CALIB = '/Users/hsunwenfang/Documents/machine-vision/data/2011_09_26_calib'
     calib_file = os.path.join(BASE_DIR_CALIB, 'calib_cam_to_cam.txt')
-    
-    # Try alternate location if strict structure not found
-    if not os.path.exists(calib_file):
-        BASE_DIR_CALIB = '/Users/hsunwenfang/Documents/machine-vision/data/2011_09_26'
-        calib_file = os.path.join(BASE_DIR_CALIB, 'calib_cam_to_cam.txt')
-    
-    if not os.path.exists(calib_file):
-        print(f"Error: Calibration file not found at {calib_file}")
-        return
 
     print(f"Loading calibration from {calib_file}")
     calib_data = parse_calib_file(calib_file)
@@ -369,9 +331,20 @@ def main():
     # Add Experiment Call
     CALIB_IMG_DIR = '/Users/hsunwenfang/Documents/machine-vision/data/2011_09_26_calib_img/2011_09_26_drive_0119_extract'
     if os.path.exists(CALIB_IMG_DIR):
-        run_recalibration_experiment(CALIB_IMG_DIR, calib_data)
+        print("\n\n=== EXPERIMENT 1: Gray Stereo (00/01) ===")
+        run_recalibration_experiment(CALIB_IMG_DIR, calib_data, 'image_00', 'image_01')
+        
+        print("\n\n=== EXPERIMENT 2: Color Stereo (02/03) ===")
+        run_recalibration_experiment(CALIB_IMG_DIR, calib_data, 'image_02', 'image_03')
     else:
         print(f"Directory for calibration images not found: {CALIB_IMG_DIR}")
 
 if __name__ == "__main__":
-    main()
+    # main()
+
+    BASE_DIR_CALIB = '/Users/hsunwenfang/Documents/machine-vision/data/2011_09_26_calib'
+    calib_file = os.path.join(BASE_DIR_CALIB, 'calib_cam_to_cam.txt')
+    print(f"Loading calibration from {calib_file}")
+    calib_data = parse_calib_file(calib_file)
+    CALIB_IMG_DIR = '/Users/hsunwenfang/Documents/machine-vision/data/2011_09_26_calib_img/2011_09_26_drive_0119_extract'
+    run_recalibration_experiment(CALIB_IMG_DIR, calib_data, 'image_00', 'image_01')
